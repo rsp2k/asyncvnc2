@@ -895,7 +895,7 @@ class Client:
         auth_types = set(await reader.readexactly(await read_int(reader, 1)))
         if not auth_types:
             raise ValueError(await read_text(reader, 'utf-8'))
-        for auth_type in (33, 1, 2):
+        for auth_type in (33, 19, 1, 2):
             if auth_type in auth_types:
                 writer.write(auth_type.to_bytes(1, 'big'))
                 break
@@ -923,6 +923,48 @@ class Client:
                 b'\x00\x01' + encryptor.update(credentials) +
                 b'\x00\x01' + host_key.encrypt(aes_key, padding=padding.PKCS1v15()))
             await reader.readexactly(4)  # unknown
+
+        # VeNCrypt authentication (subtype Plain, 256)
+        if auth_type == 19:
+            # Stage 1: server sends VeNCrypt major.minor; we echo them.
+            major = (await reader.readexactly(1))[0]
+            minor = (await reader.readexactly(1))[0]
+            writer.write(bytes([major, minor]))
+            # Stage 2: 1-byte version ack (0 = ok).
+            if (await reader.readexactly(1))[0] != 0:
+                raise ValueError(f'server rejected VeNCrypt {major}.{minor}')
+            # Stage 3: 1-byte subtype count, then that many uint32 subtypes.
+            n = (await reader.readexactly(1))[0]
+            subtypes = [
+                int.from_bytes(await reader.readexactly(4), 'big')
+                for _ in range(n)
+            ]
+            PLAIN = 256
+            if PLAIN not in subtypes:
+                other = ', '.join(str(s) for s in sorted(subtypes))
+                raise ValueError(
+                    f'server offers only TLS-wrapped VeNCrypt subtypes '
+                    f'({other}); Plain (256) not offered'
+                )
+            # Check credentials BEFORE writing the subtype selection --
+            # otherwise the server sees "Plain requested" and blocks waiting
+            # for length fields that never arrive, holding a connection slot
+            # until timeout. On servers with blacklist thresholds, an
+            # abandoned handshake also looks like a scan.
+            if username is None or password is None:
+                raise ValueError('VeNCrypt Plain requires username and password')
+            # Stage 4: pick subtype as uint32. NOTE: VeNCrypt 0.2 sends NO
+            # ack after the subtype selection (unlike the version ack in
+            # stage 2). Proceed directly to credentials.
+            writer.write(PLAIN.to_bytes(4, 'big'))
+            # Stage 5: Plain credentials -- two u32 lengths, then cleartext
+            # username and password bytes. Server validates via PAM.
+            u = username.encode('utf-8')
+            p = password.encode('utf-8')
+            writer.write(
+                len(u).to_bytes(4, 'big') +
+                len(p).to_bytes(4, 'big') +
+                u + p)
 
         # VNC authentication
         if auth_type == 2:
